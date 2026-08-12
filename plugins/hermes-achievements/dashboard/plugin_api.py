@@ -1080,7 +1080,14 @@ def scan_sessions(
 
     db = SessionDB()
     try:
-        sessions_meta = db.list_sessions_rich(limit=db_limit, include_children=True, project_compression_tips=False, include_archived=True)
+        try:
+            sessions_meta = db.list_sessions_rich(limit=db_limit, include_children=True, project_compression_tips=False, include_archived=True)
+        except TypeError:
+            # Older SessionDB (or test fakes) predates the include_archived
+            # parameter: fall back to the archived-excluded query rather
+            # than failing the whole scan. Newer backends keep counting
+            # archived sessions; older ones degrade gracefully.
+            sessions_meta = db.list_sessions_rich(limit=db_limit, include_children=True, project_compression_tips=False)
         total_sessions = len(sessions_meta)
         sessions: List[Dict[str, Any]] = []
         checkpoint_sessions: Dict[str, Any] = {}
@@ -1103,7 +1110,16 @@ def scan_sessions(
                 # real activity that happened, and hiding them made the streak
                 # collapse (a daily user showed a 2-day streak because every
                 # day before the compression window was invisible).
-                messages = db.get_messages(sid, include_inactive=True)
+                try:
+                    messages = db.get_messages(sid, include_inactive=True)
+                except TypeError:
+                    # Older SessionDB (or test fakes) predates the
+                    # include_inactive parameter: fall back to the default
+                    # active-only query rather than failing the whole scan.
+                    # Newer backends keep counting soft-deleted messages
+                    # from compressed sessions; older ones degrade
+                    # gracefully.
+                    messages = db.get_messages(sid)
                 stats = analyze_messages(sid, meta.get("title") or meta.get("preview") or "Untitled", messages)
                 rescanned += 1
 
