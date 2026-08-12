@@ -34,6 +34,28 @@ import { api } from "@/lib/api";
  *  a visible flash of the default palette on theme-overridden installs. */
 const STORAGE_KEY = "hermes-dashboard-theme";
 
+// ── Plugin SDK theme bridge ─────────────────────────────────────────────────
+// Lets dashboard plugins repaint the page without a reload. ThemeProvider
+// registers its apply-by-name function on mount; the plugin SDK's
+// `theme.apply` calls into it. The holder is null only before the first
+// provider mount (the shell mounts one immediately, so in practice plugins
+// only ever see it registered).
+let _pluginThemeApply: ((name: string) => void) | null = null;
+
+export function registerPluginThemeApply(
+  fn: ((name: string) => void) | null,
+): void {
+  _pluginThemeApply = fn;
+}
+
+/** Synchronous fire-and-forget entry for the plugin SDK. Returns false when
+ *  no theme provider is mounted yet (callers fall back to a reload hint). */
+export function pluginThemeApply(name: string): boolean {
+  if (!_pluginThemeApply) return false;
+  _pluginThemeApply(name);
+  return true;
+}
+
 /** LocalStorage key for the font override (independent of theme). Holds a
  *  font id from the catalog in `fonts.ts`, or the `THEME_DEFAULT_FONT_ID`
  *  sentinel / absent = "use the active theme's font". Pre-applied before
@@ -566,6 +588,58 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     }
     api.setFontPref(next).catch(() => {});
   }, []);
+
+  // Plugin bridge: apply a theme by name, refreshing the server list FIRST so
+  // a theme the backend just created (e.g. the theme-pack apply writing
+  // ~/.hermes/dashboard-themes/) is resolvable and applyable immediately.
+  const applyThemeByName = useCallback(
+    async (name: string) => {
+      let resp: {
+        themes?: ThemeListEntry[];
+        active?: string;
+      } | null = null;
+      try {
+        resp = await api.getThemes();
+      } catch {
+        // Fall back to the in-memory list; validation still works for
+        // anything already known to this page.
+      }
+      const known = new Set<string>([
+        ...Object.keys(BUILTIN_THEMES),
+        ...(resp?.themes ?? availableThemes).map((t) => t.name),
+      ]);
+      const next = known.has(name) ? name : "default";
+      if (resp?.themes) {
+        setAvailableThemes(
+          resp.themes.map((t) => ({
+            name: t.name,
+            label: t.label,
+            description: t.description,
+            definition: t.definition,
+          })),
+        );
+        const defs: Record<string, DashboardTheme> = {};
+        for (const entry of resp.themes) {
+          if (entry.definition) {
+            defs[entry.name] = entry.definition;
+          }
+        }
+        if (Object.keys(defs).length > 0) setUserThemeDefs(defs);
+      }
+      setThemeName(next);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(STORAGE_KEY, next);
+      }
+      api.setTheme(next).catch(() => {});
+    },
+    [availableThemes],
+  );
+
+  // Keep the plugin SDK's theme.apply pointed at this provider instance.
+  useEffect(() => {
+    registerPluginThemeApply(applyThemeByName);
+    return () => registerPluginThemeApply(null);
+  }, [applyThemeByName]);
 
   const value = useMemo<ThemeContextValue>(
     () => ({

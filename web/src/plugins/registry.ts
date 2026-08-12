@@ -29,6 +29,7 @@ import { Label } from "@nous-research/ui/ui/components/label";
 import { Separator } from "@nous-research/ui/ui/components/separator";
 import { Tabs, TabsList, TabsTrigger } from "@nous-research/ui/ui/components/tabs";
 import { useI18n } from "@/i18n";
+import { pluginThemeApply } from "@/themes";
 import { registerSlot, PluginSlot } from "./slots";
 
 // ---------------------------------------------------------------------------
@@ -161,6 +162,12 @@ export function exposePluginSDK() {
 
     // Utilities
     utils: { cn, timeAgo, isoTimeAgo },
+
+    // Live theme application for plugins (additive SDK surface). Apply a
+    // dashboard theme by name: persists server-side AND repaints the page
+    // without a reload. Returns false when no theme provider is mounted yet
+    // (callers should fall back to a reload hint).
+    theme: { apply: (name: string) => pluginThemeApply(name) },
 
     // Hooks
     useI18n,

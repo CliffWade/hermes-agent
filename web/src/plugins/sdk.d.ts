@@ -148,6 +148,16 @@ export interface HermesPluginSDK {
    * ``I18nContextValue`` shape. Plugins typically call ``useI18n().t(...)``.
    */
   useI18n: () => unknown;
+
+  /**
+   * Live dashboard theme application. ``apply(name)`` persists the theme
+   * server-side (``config.yaml`` ``dashboard.theme``) AND repaints the page
+   * immediately, refreshing the server theme list first so a theme the
+   * backend just created is resolvable. Returns ``false`` when no theme
+   * provider is mounted yet (rare; the shell mounts one on boot) — callers
+   * should fall back to telling the user to reload.
+   */
+  theme: { apply: (name: string) => boolean };
 }
 
 declare global {

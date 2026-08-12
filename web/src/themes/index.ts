@@ -1,4 +1,4 @@
-export { ThemeProvider, useTheme } from "./context";
+export { ThemeProvider, useTheme, pluginThemeApply } from "./context";
 export { BUILTIN_THEMES, defaultTheme } from "./presets";
 export {
   FONT_CHOICES,
