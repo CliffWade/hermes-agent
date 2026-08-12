@@ -21,13 +21,19 @@ except ImportError:
         return Path(val) if val else Path.home() / ".hermes"
 
 try:
-    from fastapi import APIRouter
+    from fastapi import APIRouter, Response
 except Exception:  # Allows local unit tests without dashboard dependencies.
     class APIRouter:  # type: ignore
         def get(self, *_args, **_kwargs):
             return lambda fn: fn
         def post(self, *_args, **_kwargs):
             return lambda fn: fn
+        def delete(self, *_args, **_kwargs):
+            return lambda fn: fn
+    class Response:  # type: ignore
+        def __init__(self, content: str = "", media_type: str = ""):
+            self.content = content
+            self.media_type = media_type
 
 router = APIRouter()
 
@@ -139,7 +145,460 @@ ACHIEVEMENTS: List[Dict[str, Any]] = [
     {"id": "weekend_warrior", "name": "Weekend Warrior", "description": "Run Hermes on weekends enough times to make it a lifestyle.", "category": "Lifestyle", "kind": "lifetime", "icon": "calendar", "threshold_metric": "weekend_sessions", "tiers": tiers([25, 75, 200, 600, 1500])},
     {"id": "night_shift_operator", "name": "Night Shift Operator", "description": "Run sessions during gremlin hours repeatedly.", "category": "Lifestyle", "kind": "lifetime", "icon": "moon", "threshold_metric": "night_sessions", "tiers": tiers([25, 75, 200, 600, 1500])},
     {"id": "cache_hit_appreciator", "name": "Cache Hit Appreciator", "description": "Notice or benefit from prompt/cache behavior.", "category": "Lifestyle", "kind": "lifetime", "icon": "cache", "secret": True, "threshold_metric": "cache_events", "tiers": tiers([100, 300, 1000, 3000, 8000])},
+
+    # Streaks — consecutive-day usage (computed from session dates)
+    {"id": "streak_burner", "name": "Streak Burner", "description": "Keep Hermes lit on consecutive days — a streak is a habit.", "category": "Lifestyle", "kind": "lifetime", "icon": "flame", "threshold_metric": "max_streak_days", "tiers": tiers([3, 7, 14, 30, 60])},
+
+    # Set collections — complete every achievement in a category
+    {"id": "set_autonomy", "name": "Autonomy Complete", "description": "Unlock every Agent Autonomy achievement.", "category": "Sets", "kind": "collection", "icon": "trophy", "collection": "Agent Autonomy"},
+    {"id": "set_debugging", "name": "Debugging Complete", "description": "Unlock every Debugging Chaos achievement.", "category": "Sets", "kind": "collection", "icon": "trophy", "collection": "Debugging Chaos"},
+    {"id": "set_vibe", "name": "Vibe Complete", "description": "Unlock every Vibe Coding achievement.", "category": "Sets", "kind": "collection", "icon": "trophy", "collection": "Vibe Coding"},
+    {"id": "set_hermes_native", "name": "Native Complete", "description": "Unlock every Hermes Native achievement.", "category": "Sets", "kind": "collection", "icon": "trophy", "collection": "Hermes Native"},
+    {"id": "set_research", "name": "Research Complete", "description": "Unlock every Research/Web achievement.", "category": "Sets", "kind": "collection", "icon": "trophy", "collection": "Research/Web"},
+    {"id": "set_tools", "name": "Tools Complete", "description": "Unlock every Tool Mastery achievement.", "category": "Sets", "kind": "collection", "icon": "trophy", "collection": "Tool Mastery"},
+    {"id": "set_models", "name": "Models Complete", "description": "Unlock every Model Lore achievement.", "category": "Sets", "kind": "collection", "icon": "trophy", "collection": "Model Lore"},
+    {"id": "set_lifestyle", "name": "Lifestyle Complete", "description": "Unlock every Lifestyle achievement.", "category": "Sets", "kind": "collection", "icon": "trophy", "collection": "Lifestyle"},
 ]
+
+
+REWARDS: List[Dict[str, Any]] = [
+    {
+        "id": "theme_diamond",
+        "name": "Diamond Theme",
+        "description": "Reach Diamond tier on any achievement to unlock the exclusive Diamond theme.",
+        "kind": "tier_reached",
+        "tier": "Diamond",
+        "theme": "reward-diamond",
+    },
+    {
+        "id": "theme_streak30",
+        "name": "Streak Theme",
+        "description": "Hold a 30-day Hermes streak to unlock the exclusive Streak theme.",
+        "kind": "streak",
+        "streak_days": 30,
+        "theme": "reward-streak",
+    },
+    {
+        "id": "theme_olympian",
+        "name": "Olympian Theme",
+        "description": "Reach Olympian tier on any achievement to unlock the exclusive Olympian theme.",
+        "kind": "tier_reached",
+        "tier": "Olympian",
+        "theme": "reward-olympian",
+    },
+    {
+        "id": "theme_sets",
+        "name": "Completionist Theme",
+        "description": "Complete every set collection to unlock the exclusive Completionist theme.",
+        "kind": "all_sets",
+        "theme": "reward-completionist",
+    },
+]
+
+
+def evaluate_rewards(achievements: List[Dict[str, Any]], aggregate: Dict[str, Any], unlocked_ids: Set[str]) -> List[Dict[str, Any]]:
+    """Evaluate reward status from evaluated achievements + aggregate.
+
+    Returns reward entries with ``unlocked`` and a human ``progress`` note.
+    """
+    tier_rank = {t: i for i, t in enumerate(TIER_NAMES)}
+    max_tier = "None"
+    max_rank = -1
+    for a in achievements:
+        t = a.get("tier")
+        if not isinstance(t, str) or t not in tier_rank:
+            continue
+        r = tier_rank[t]
+        if r > max_rank:
+            max_rank = r
+            max_tier = t
+
+    sets = [a for a in achievements if a.get("kind") == "collection"]
+    sets_done = sum(1 for s in sets if s.get("unlocked"))
+    sets_total = len(sets)
+
+    out = []
+    for reward in REWARDS:
+        kind = reward["kind"]
+        unlocked = False
+        progress = ""
+        if kind == "tier_reached":
+            target = reward["tier"]
+            target_rank = tier_rank.get(target, 0)
+            unlocked = max_rank >= target_rank
+            progress = f"highest tier: {max_tier}" if max_tier != "None" else "no achievements yet"
+        elif kind == "streak":
+            streak = int(aggregate.get("max_streak_days") or 0)
+            cur = int(aggregate.get("current_streak_days") or 0)
+            unlocked = streak >= reward["streak_days"]
+            progress = f"current streak: {cur} days · longest streak: {streak} days"
+        elif kind == "all_sets":
+            unlocked = sets_total > 0 and sets_done == sets_total
+            progress = f"sets complete: {sets_done}/{sets_total}"
+        out.append({**reward, "unlocked": unlocked, "progress": progress})
+    return out
+
+
+REWARD_THEMES: Dict[str, str] = {
+    "reward-diamond": """# Exclusive reward: reach Diamond tier on any achievement.
+name: reward-diamond
+description: Diamond achievement reward. Icy depth, brilliant accents.
+colors:
+  background: "#0b1020"
+  ui_accent: "#8ec5ff"
+  banner_accent: "#8ec5ff"
+  banner_title: "#e8f1ff"
+  banner_text: "#d5e4ff"
+  ui_text: "#d5e4ff"
+  banner_dim: "#8ea3c9"
+  banner_border: "#1c2a4a"
+  ui_border: "#223357"
+  status_bar_bg: "#0b1020"
+  status_bar_text: "#8ea3c9"
+  input_bg: "#101a33"
+  input_text: "#e8f1ff"
+  input_rule: "#8ec5ff"
+  response_border: "#3a5a9e"
+  ok: "#7fd8a4"
+  warn: "#f0c674"
+  error: "#ff8f9f"
+  diff_add: "#7fd8a4"
+  diff_del: "#ff8f9f"
+  diff_line: "#8ec5ff"
+  syntax_keyword: "#8ec5ff"
+  syntax_string: "#7fd8a4"
+  syntax_number: "#f0c674"
+  syntax_comment: "#8ea3c9"
+  syntax_function: "#c9a0ff"
+  syntax_type: "#7fd8a4"
+  syntax_variable: "#e8f1ff"
+  completion_bg: "#101a33"
+  completion_text: "#d5e4ff"
+  completion_accent: "#8ec5ff"
+  chat_bubble_user: "#1c2a4a"
+  chat_bubble_assistant: "#101a33"
+  hover: "#14224a"
+  active: "#1c2a4a"
+branding:
+  agent_name: "Diamond Agent"
+  welcome: "Shine on."
+  response_label: " 💎 Diamond "
+  prompt_symbol: "◆"
+tool_prefix: "◆"
+""",
+    "reward-streak": """# Exclusive reward: hold a 30-day Hermes streak.
+name: reward-streak
+description: Streak achievement reward. Ember glow, unstoppable run.
+colors:
+  background: "#1c0f07"
+  ui_accent: "#ffb454"
+  banner_accent: "#ffb454"
+  banner_title: "#ffedd5"
+  banner_text: "#f5dfc4"
+  ui_text: "#f5dfc4"
+  banner_dim: "#c99b6e"
+  banner_border: "#40240f"
+  ui_border: "#4c2d14"
+  status_bar_bg: "#1c0f07"
+  status_bar_text: "#c99b6e"
+  input_bg: "#2a1709"
+  input_text: "#ffedd5"
+  input_rule: "#ffb454"
+  response_border: "#8a4d1d"
+  ok: "#a3e07a"
+  warn: "#ffd479"
+  error: "#ff8a7a"
+  diff_add: "#a3e07a"
+  diff_del: "#ff8a7a"
+  diff_line: "#ffb454"
+  syntax_keyword: "#ffb454"
+  syntax_string: "#a3e07a"
+  syntax_number: "#ffd479"
+  syntax_comment: "#c99b6e"
+  syntax_function: "#e0a0ff"
+  syntax_type: "#a3e07a"
+  syntax_variable: "#ffedd5"
+  completion_bg: "#2a1709"
+  completion_text: "#f5dfc4"
+  completion_accent: "#ffb454"
+  chat_bubble_user: "#40240f"
+  chat_bubble_assistant: "#2a1709"
+  hover: "#3a1e0c"
+  active: "#40240f"
+branding:
+  agent_name: "Streak Agent"
+  welcome: "Keep the fire going."
+  response_label: " 🔥 Streak "
+  prompt_symbol: "▶"
+tool_prefix: "▶"
+""",
+    "reward-olympian": """# Exclusive reward: reach Olympian tier on any achievement.
+name: reward-olympian
+description: Olympian achievement reward. Summit gold, mythic heights.
+colors:
+  background: "#141020"
+  ui_accent: "#ffd700"
+  banner_accent: "#ffd700"
+  banner_title: "#fff8e0"
+  banner_text: "#f2ead0"
+  ui_text: "#f2ead0"
+  banner_dim: "#b3a77e"
+  banner_border: "#322a4a"
+  ui_border: "#3a3055"
+  status_bar_bg: "#141020"
+  status_bar_text: "#b3a77e"
+  input_bg: "#1e1833"
+  input_text: "#fff8e0"
+  input_rule: "#ffd700"
+  response_border: "#7a6a2e"
+  ok: "#a8e080"
+  warn: "#ffe07a"
+  error: "#ff9a8a"
+  diff_add: "#a8e080"
+  diff_del: "#ff9a8a"
+  diff_line: "#ffd700"
+  syntax_keyword: "#ffd700"
+  syntax_string: "#a8e080"
+  syntax_number: "#ffe07a"
+  syntax_comment: "#b3a77e"
+  syntax_function: "#e0b0ff"
+  syntax_type: "#a8e080"
+  syntax_variable: "#fff8e0"
+  completion_bg: "#1e1833"
+  completion_text: "#f2ead0"
+  completion_accent: "#ffd700"
+  chat_bubble_user: "#322a4a"
+  chat_bubble_assistant: "#1e1833"
+  hover: "#282040"
+  active: "#322a4a"
+branding:
+  agent_name: "Olympian Agent"
+  welcome: "You stand at the summit."
+  response_label: " 🏆 Olympian "
+  prompt_symbol: "★"
+tool_prefix: "★"
+""",
+    "reward-completionist": """# Exclusive reward: complete every set collection.
+name: reward-completionist
+description: Completionist reward. Every set mastered, every badge earned.
+colors:
+  background: "#101418"
+  ui_accent: "#9fe8b0"
+  banner_accent: "#9fe8b0"
+  banner_title: "#eafff0"
+  banner_text: "#d4eadb"
+  ui_text: "#d4eadb"
+  banner_dim: "#8fa89a"
+  banner_border: "#22302a"
+  ui_border: "#2a3a32"
+  status_bar_bg: "#101418"
+  status_bar_text: "#8fa89a"
+  input_bg: "#182228"
+  input_text: "#eafff0"
+  input_rule: "#9fe8b0"
+  response_border: "#3a6a4e"
+  ok: "#9fe8b0"
+  warn: "#f0e080"
+  error: "#ff9a8a"
+  diff_add: "#9fe8b0"
+  diff_del: "#ff9a8a"
+  diff_line: "#9fe8b0"
+  syntax_keyword: "#9fe8b0"
+  syntax_string: "#c8f0d0"
+  syntax_number: "#f0e080"
+  syntax_comment: "#8fa89a"
+  syntax_function: "#e0b0ff"
+  syntax_type: "#c8f0d0"
+  syntax_variable: "#eafff0"
+  completion_bg: "#182228"
+  completion_text: "#d4eadb"
+  completion_accent: "#9fe8b0"
+  chat_bubble_user: "#22302a"
+  chat_bubble_assistant: "#182228"
+  hover: "#1e2c26"
+  active: "#22302a"
+branding:
+  agent_name: "Completionist Agent"
+  welcome: "Nothing left undone."
+  response_label: " 🏅 Completionist "
+  prompt_symbol: "✓"
+tool_prefix: "✓"
+""",
+}
+
+
+# ── XP + level meta-layer ───────────────────────────────────────────────────
+# Every tier unlock grants XP; total XP drives a level with a name. The level
+# never resets, so there is always a progression number that grows even after
+# every badge is unlocked.
+
+TIER_XP = {"Copper": 10, "Silver": 25, "Gold": 50, "Diamond": 100, "Olympian": 250}
+COLLECTION_XP = 200
+SECRET_BONUS_XP = 25
+_TIER_RANK = {t: i for i, t in enumerate(TIER_NAMES)}
+
+
+def tier_rank_of(tier) -> int:
+    """Rank a tier name (Olympian highest). Non-tier values rank below Copper."""
+    if isinstance(tier, str):
+        return _TIER_RANK.get(tier, -1)
+    return -1
+
+# Level names 1-50 (every 5 gets a distinct title; odd levels are gradations).
+LEVEL_NAMES = {
+    1: "Initiate",
+    2: "Scout",
+    3: "Helper",
+    4: "Builder",
+    5: "Operator",
+    6: "Fixer",
+    7: "Tinkerer",
+    8: "Craftsman",
+    9: "Artisan",
+    10: "Journeyman",
+    11: "Navigator",
+    12: "Strategist",
+    13: "Planner",
+    14: "Architect",
+    15: "Vanguard",
+    16: "Optimizer",
+    17: "Automator",
+    18: "Integrator",
+    19: "Explorer",
+    20: "Veteran",
+    21: "Specialist",
+    22: "Mentor",
+    23: "Brewer",
+    24: "Sculptor",
+    25: "Commander",
+    26: "Synthesizer",
+    27: "Visionary",
+    28: "Catalyst",
+    29: "Engineer",
+    30: "Champion",
+    31: "Virtuoso",
+    32: "Orchestrator",
+    33: "Showrunner",
+    34: "Trailblazer",
+    35: "Warlord",
+    36: "Cartographer",
+    37: "Maestro",
+    38: "Alchemist",
+    39: "Titan",
+    40: "Conqueror",
+    41: "Oracle",
+    42: "Legend",
+    43: "Myth",
+    44: "Deity",
+    45: "Ascendant",
+    46: "Transcendent",
+    47: "Immortal",
+    48: "Cosmic",
+    49: "Singularity",
+    50: "Hermes",
+}
+
+
+def xp_for(achievement: Dict[str, Any]) -> int:
+    """XP contribution for one evaluated achievement (highest tier reached)."""
+    if achievement.get("kind") == "collection":
+        return COLLECTION_XP if achievement.get("unlocked") else 0
+    tier = achievement.get("tier")
+    xp = TIER_XP.get(tier, 0) if isinstance(tier, str) else 0
+    if xp and achievement.get("state") == "secret":
+        xp += SECRET_BONUS_XP
+    return xp
+
+
+def level_for_xp(xp: int) -> Dict[str, Any]:
+    """Map total XP to {level, name, xp_in_level, xp_for_next}."""
+    level = 1
+    xp_prev = 0
+    xp_next = 100
+    while xp >= xp_next and level < 50:
+        level += 1
+        xp_prev = xp_next
+        xp_next += 75 + (level - 1) * 25
+    return {
+        "level": level,
+        "name": LEVEL_NAMES.get(level, "Hermes"),
+        "xp": xp,
+        "xp_in_level": xp - xp_prev,
+        "xp_for_next": xp_next - xp_prev,
+        "next_name": LEVEL_NAMES.get(level + 1, "Hermes"),
+    }
+
+
+def compute_xp(achievements: List[Dict[str, Any]], aggregate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    total = sum(xp_for(a) for a in achievements)
+    if aggregate is not None:
+        total += quest_xp(evaluate_quests(achievements, aggregate))
+    info = level_for_xp(total)
+    info["total_xp"] = total
+    return info
+
+
+# ── Custom metric achievements ──────────────────────────────────────────────
+# User-defined goal badges ("500 terminal calls this week") evaluated by the
+# same engine, stored separately from the permanent catalog. Each goal names
+# a metric and a target; progress is computed from the aggregate.
+
+CUSTOM_METRIC_METRICS = {
+    "session_count": "Hermes sessions",
+    "total_tool_calls": "Total tool calls",
+    "total_terminal_calls": "Terminal calls",
+    "max_streak_days": "Longest streak (days)",
+    "current_streak_days": "Current streak (days)",
+    "distinct_tool_count": "Distinct tools used",
+    "distinct_model_count": "Distinct models used",
+    "distinct_provider_count": "Distinct providers used",
+    "distinct_days_active": "Distinct days active",
+    "total_messages": "Total messages",
+    "total_tokens": "Total tokens",
+}
+
+
+def custom_goals_path() -> Path:
+    return get_hermes_home() / "plugins" / "hermes-achievements" / "custom_goals.json"
+
+
+def load_custom_goals() -> List[Dict[str, Any]]:
+    try:
+        if custom_goals_path().exists():
+            return json.loads(custom_goals_path().read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
+def save_custom_goals(goals: List[Dict[str, Any]]) -> None:
+    try:
+        custom_goals_path().parent.mkdir(parents=True, exist_ok=True)
+        custom_goals_path().write_text(json.dumps(goals, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def evaluate_custom_goals(goals: List[Dict[str, Any]], aggregate: Dict[str, Any], sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for g in goals:
+        metric = g.get("metric", "")
+        target = int(g.get("target") or 0)
+        value = 0
+        if metric == "distinct_days_active":
+            value = len({time.strftime("%Y-%m-%d", time.localtime(float(s.get("started_at") or 0))) for s in sessions if s.get("started_at")})
+        else:
+            value = int(aggregate.get(metric) or 0)
+        pct = min(100, round((value / target) * 100)) if target else 0
+        out.append({
+            **g,
+            "value": value,
+            "target": target,
+            "done": value >= target,
+            "pct": pct,
+            "metric_label": CUSTOM_METRIC_METRICS.get(metric, metric),
+        })
+    return out
 
 
 def state_path() -> Path:
@@ -313,10 +772,27 @@ def analyze_messages(session_id: str, title: str, messages: List[Dict[str, Any]]
     files_touched: Set[str] = set()
     full_text_parts: List[str] = []
     error_count = 0
+    # Calendar days (year, yday) on which this session actually had messages.
+    # The desktop keeps long-lived sessions open across many days; started_at
+    # alone undercounts streaks, so capture the days with real activity here.
+    active_days: Set[tuple] = set()
 
     for msg in messages:
         text = _content(msg)
         full_text_parts.append(text)
+        ts = msg.get("timestamp")
+        if ts:
+            try:
+                # Count a day as active only for REAL activity: active rows
+                # plus compacted history (pre-compaction turns Hermes kept on
+                # disk, discoverable in search). Exclude rewound/undo rows
+                # (active=0 AND compacted=0) — those are content the user took
+                # back, not activity that should feed a streak.
+                if msg.get("active", 1) or msg.get("compacted"):
+                    lt = time.localtime(float(ts))
+                    active_days.add((lt.tm_year, lt.tm_yday))
+            except Exception:
+                pass
         if msg.get("tool_name"):
             name = str(msg["tool_name"])
             tool_names.add(name)
@@ -362,6 +838,7 @@ def analyze_messages(session_id: str, title: str, messages: List[Dict[str, Any]]
         "message_count": len(messages),
         "tool_call_count": len(tool_sequence),
         "tool_names": tool_names,
+        "active_days": sorted(active_days),
         "distinct_tool_count": len(tool_names),
         "error_count": error_count,
         "terminal_calls": terminal_calls,
@@ -524,6 +1001,8 @@ METRIC_LABELS = {
     "session_count": "Hermes sessions",
     "weekend_sessions": "sessions started on weekends",
     "night_sessions": "sessions started late night or before dawn",
+    "max_streak_days": "consecutive days with Hermes sessions",
+    "current_streak_days": "current consecutive-day streak",
 }
 
 
@@ -601,7 +1080,7 @@ def scan_sessions(
 
     db = SessionDB()
     try:
-        sessions_meta = db.list_sessions_rich(limit=db_limit, include_children=True, project_compression_tips=False)
+        sessions_meta = db.list_sessions_rich(limit=db_limit, include_children=True, project_compression_tips=False, include_archived=True)
         total_sessions = len(sessions_meta)
         sessions: List[Dict[str, Any]] = []
         checkpoint_sessions: Dict[str, Any] = {}
@@ -618,7 +1097,13 @@ def scan_sessions(
                 stats = dict(cached_stats)
                 reused += 1
             else:
-                messages = db.get_messages(sid)
+                # Load BOTH active and soft-deleted messages. Hermes rewinds /
+                # compresses long conversations by soft-deleting (active=0)
+                # old messages while keeping the row; those messages are still
+                # real activity that happened, and hiding them made the streak
+                # collapse (a daily user showed a 2-day streak because every
+                # day before the compression window was invisible).
+                messages = db.get_messages(sid, include_inactive=True)
                 stats = analyze_messages(sid, meta.get("title") or meta.get("preview") or "Untitled", messages)
                 rescanned += 1
 
@@ -700,6 +1185,8 @@ def aggregate_stats(sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
         "local_model_chat_sessions": 0,
         "weekend_sessions": 0,
         "night_sessions": 0,
+        "max_streak_days": 0,
+        "current_streak_days": 0,
     }
     sum_keys = [
         "traceback_events", "log_read_events", "port_conflict_events", "permission_denied_events", "install_error_events", "install_success_events", "restart_after_error_events", "env_var_error_events", "yaml_error_events", "docker_conflict_events", "frontend_activity_events", "css_activity_events", "git_events", "tiny_patch_after_errors_events", "skill_events", "skill_manage_events", "memory_events", "memory_write_events", "context_events", "gateway_events", "plugin_events", "rollback_events", "docs_activity_events", "model_events", "openrouter_events", "codex_events", "claude_events", "gemini_events", "local_model_events", "toolset_events", "config_events", "git_history_events", "test_events", "screenshot_events", "release_events", "cache_events",
@@ -752,7 +1239,74 @@ def aggregate_stats(sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
                 pass
     agg["distinct_model_count"] = len({m for m in model_names if m and m != "None"})
     agg["distinct_provider_count"] = len(provider_names)
+    agg["max_streak_days"], agg["current_streak_days"] = _streak_days(sessions)
     return agg
+
+
+def _streak_days(sessions: List[Dict[str, Any]]) -> tuple:
+    """Return (max_streak_days, current_streak_days) from session activity.
+
+    A "streak day" is a calendar day (local time) that had at least one
+    Hermes session. The max streak is the longest run of consecutive days
+    with sessions; the current streak is the run ending at the most recent
+    activity day (still alive if that day is today or yesterday — a missed
+    day that's still today does not break the streak until the day passes).
+
+    Activity comes from three signals, in order of accuracy:
+    1. ``active_days`` — per-session list of calendar days that actually had
+       messages (captured by ``analyze_messages``). This is the ground truth:
+       a desktop session can stay open for a week and be used every day, and
+       every one of those days lands in this list.
+    2. ``last_active`` — the freshest heartbeat / latest message timestamp.
+       Re-anchors long-lived sessions on the day they were last used, which
+       matters when the checkpoint cache serves older analysis that predates
+       the ``active_days`` field.
+    3. ``started_at`` — the day the session began.
+    """
+    days: Set[tuple] = set()
+    for s in sessions:
+        per_session_days = s.get("active_days")
+        if isinstance(per_session_days, (list, set, tuple)):
+            for d in per_session_days:
+                if isinstance(d, (list, tuple)) and len(d) == 2:
+                    days.add((int(d[0]), int(d[1])))
+            # active_days is authoritative; skip the anchor fallbacks.
+            continue
+        for anchor in ("started_at", "last_active"):
+            ts = s.get(anchor)
+            if not ts:
+                continue
+            try:
+                lt = time.localtime(float(ts))
+                days.add((lt.tm_year, lt.tm_yday))
+            except Exception:
+                continue
+    if not days:
+        return (0, 0)
+    ordered = sorted(days)
+    # Map consecutive day tuples to day numbers since epoch for arithmetic.
+    day_nums = []
+    for year, yday in ordered:
+        base = int(time.mktime((year, 1, 1, 0, 0, 0, 0, 0, -1)))
+        day_nums.append(base // 86400 + yday - 1)
+    max_streak = 1
+    cur_run = 1
+    for i in range(1, len(day_nums)):
+        if day_nums[i] == day_nums[i - 1] + 1:
+            cur_run += 1
+            max_streak = max(max_streak, cur_run)
+        elif day_nums[i] != day_nums[i - 1]:
+            cur_run = 1
+    # Current streak: the run that ends at the latest active day. If that
+    # day is not today and not yesterday, the streak has lapsed.
+    last_day = day_nums[-1]
+    now = time.localtime()
+    today = int(time.mktime((now.tm_year, 1, 1, 0, 0, 0, 0, 0, -1))) // 86400 + now.tm_yday - 1
+    if last_day < today - 1:
+        current = 0
+    else:
+        current = cur_run
+    return (max_streak, current)
 
 
 def evaluate_definition(definition: Dict[str, Any], aggregate: Dict[str, Any]) -> Dict[str, Any]:
@@ -761,6 +1315,30 @@ def evaluate_definition(definition: Dict[str, Any], aggregate: Dict[str, Any]) -
     if "requirements" in definition:
         return evaluate_requirements(definition, aggregate)
     return evaluate_boolean(definition, aggregate)
+
+
+def evaluate_collection(definition: Dict[str, Any], unlocked_ids: Set[str]) -> Dict[str, Any]:
+    """A set-collection badge unlocks when every achievement in its category
+    is in the unlock ledger. Progress is the fraction of category members
+    unlocked, so the card shows a real completion bar.
+    """
+    collection = definition.get("collection", "")
+    members = [a for a in ACHIEVEMENTS if a.get("category") == collection and a.get("kind") != "collection"]
+    if not members:
+        return {"unlocked": False, "discovered": True, "state": "discovered", "tier": None, "progress": 0, "next_tier": None, "next_threshold": 1, "progress_pct": 0}
+    unlocked_members = sum(1 for m in members if m["id"] in unlocked_ids)
+    complete = unlocked_members == len(members)
+    pct = math.floor((unlocked_members / len(members)) * 100)
+    return {
+        "unlocked": complete,
+        "discovered": unlocked_members > 0,
+        "state": "unlocked" if complete else "discovered",
+        "tier": "Olympian" if complete else None,
+        "progress": unlocked_members,
+        "next_tier": None,
+        "next_threshold": len(members),
+        "progress_pct": 100 if complete else min(99, pct),
+    }
 
 
 def evidence_for(definition: Dict[str, Any], sessions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -784,6 +1362,350 @@ def evidence_for(definition: Dict[str, Any], sessions: List[Dict[str, Any]]) -> 
     return None
 
 
+def _eta_days_for(item: Dict[str, Any], rates: Dict[str, float]) -> Optional[int]:
+    """Days until the next tier at the recent daily rate.
+
+    Only for lifetime accumulation metrics (a best-session feat can jump
+    in one run, so a rate-based estimate would mislead). Returns None when
+    the metric has no observed recent rate or nothing remains to accumulate.
+    """
+    if item.get("unlocked") or item.get("kind") != "lifetime" or not item.get("threshold_metric"):
+        return None
+    metric = item["threshold_metric"]
+    rate = rates.get(metric, 0.0)
+    remaining = max(0, int(item.get("next_threshold") or 0) - int(item.get("progress") or 0))
+    if rate <= 0 or remaining <= 0:
+        return None
+    return max(1, math.ceil(remaining / rate))
+
+
+def _activity_calendar(sessions: List[Dict[str, Any]], days: int = 365) -> List[Dict[str, Any]]:
+    """Daily session + tool-call counts for the last ``days`` calendar days.
+
+    Returns a list aligned to the last ``days`` days (oldest first), each
+    entry: {"date": "YYYY-MM-DD", "sessions": n, "tools": n}. Days with no
+    activity are present with zeros so the desktop can render a contiguous
+    GitHub-style heatmap without filling gaps itself.
+    """
+    cutoff = time.time() - days * 86400
+    daily: Dict[str, List[int]] = {}
+    for s in sessions:
+        started = s.get("started_at")
+        if not started:
+            continue
+        try:
+            ts = float(started)
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        lt = time.localtime(ts)
+        key = f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
+        entry = daily.setdefault(key, [0, 0])
+        entry[0] += 1
+        entry[1] += int(s.get("tool_call_count") or 0)
+
+    out: List[Dict[str, Any]] = []
+    now_lt = time.localtime()
+    today = f"{now_lt.tm_year:04d}-{now_lt.tm_mon:02d}-{now_lt.tm_mday:02d}"
+    # Walk back from today, at most `days` entries.
+    cursor = time.mktime((now_lt.tm_year, now_lt.tm_mon, now_lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    for _ in range(days):
+        lt = time.localtime(cursor)
+        key = f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
+        if key > today:
+            cursor -= 86400
+            continue
+        counts = daily.get(key, [0, 0])
+        out.append({"date": key, "sessions": counts[0], "tools": counts[1]})
+        cursor -= 86400
+        if key == "1970-01-01":
+            break
+    out.reverse()
+    return out
+
+
+def _category_summary(achievements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per-category completion counts for the header chips.
+
+    Each entry: {category, total, unlocked, pct}. Sorted by total desc so the
+    header row reads in a stable order.
+    """
+    by_cat: Dict[str, Dict[str, Any]] = {}
+    for a in achievements:
+        cat = a.get("category") or "Other"
+        if a.get("kind") == "collection":
+            continue
+        entry = by_cat.setdefault(cat, {"category": cat, "total": 0, "unlocked": 0})
+        entry["total"] += 1
+        if a.get("unlocked"):
+            entry["unlocked"] += 1
+    out = []
+    for entry in by_cat.values():
+        entry["pct"] = round((entry["unlocked"] / entry["total"]) * 100) if entry["total"] else 0
+        out.append(entry)
+    out.sort(key=lambda e: (-e["total"], e["category"]))
+    return out
+
+
+def _monthly_challenges(sessions: List[Dict[str, Any]], achievements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Evaluate the rotating monthly challenge set against current-month data.
+
+    Challenges are time-boxed goals computed from the same scan data, so they
+    stay fresh without adding permanent achievements:
+      - sessions: Hermes sessions started this month
+      - tool_calls: tool calls made this month
+      - active_days: distinct days with sessions this month
+      - unlocks: badges unlocked this month (from unlocked_at)
+      - tier_ups: tier upgrades earned this month (from unlocked_at)
+      - streak: current streak in days
+    """
+    now = time.time()
+    lt = time.localtime(now)
+    month_start = time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+    month_sessions = [s for s in sessions if float(s.get("started_at") or 0) >= month_start]
+    active_days = {time.strftime("%Y-%m-%d", time.localtime(float(s["started_at"]))) for s in month_sessions if s.get("started_at")}
+    month_unlocks = [a for a in achievements if a.get("unlocked") and a.get("unlocked_at") and float(a["unlocked_at"]) >= month_start]
+    tier_ups = [a for a in month_unlocks if a.get("tier") and a.get("kind") != "collection"]
+
+    def base(id_, name, desc, value, target):
+        return {
+            "id": id_,
+            "name": name,
+            "description": desc,
+            "value": value,
+            "target": target,
+            "done": value >= target,
+            "pct": min(100, round((value / target) * 100)) if target else 0,
+        }
+
+    month_name = time.strftime("%B", lt)
+    return [
+        base("m_sessions", f"{month_name} Sessions", "Sessions started this month", len(month_sessions), 10),
+        base("m_tool_calls", f"{month_name} Tool Calls", "Tool calls made this month", sum(int(s.get("tool_call_count") or 0) for s in month_sessions), 500),
+        base("m_active_days", f"{month_name} Active Days", "Distinct days with activity this month", len(active_days), 12),
+        base("m_unlocks", f"{month_name} Unlocks", "Badges unlocked this month", len(month_unlocks), 3),
+        base("m_tier_ups", f"{month_name} Tier Ups", "Tier upgrades this month", len(tier_ups), 2),
+        base("m_streak", "Streak This Month", "Current consecutive-day streak", int(_streak_days(sessions)[1] or 0), 14),
+    ]
+
+
+def _records(sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Personal records — bests the user can beat (replay value).
+
+    Computed from session data: best day by tool calls, longest session by
+    message count (the closest honest proxy — session ``last_active`` is the
+    last-activity date, not a duration, so wall-clock math is misleading),
+    most sessions in one day, biggest session by tool calls.
+    """
+    best_day: Dict[str, Dict[str, Any]] = {}
+    sessions_per_day: Dict[str, int] = {}
+    best_session: Optional[Dict[str, Any]] = None
+    longest_session: Optional[Dict[str, Any]] = None
+    for s in sessions:
+        started = s.get("started_at")
+        if not started:
+            continue
+        try:
+            ts = float(started)
+        except Exception:
+            continue
+        lt = time.localtime(ts)
+        day = f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
+        tools = int(s.get("tool_call_count") or 0)
+        msgs = int(s.get("message_count") or 0)
+        sessions_per_day[day] = sessions_per_day.get(day, 0) + 1
+        cur = best_day.setdefault(day, {"tools": 0})
+        cur["tools"] += tools
+        if best_session is None or tools > int(best_session.get("tool_call_count") or 0):
+            best_session = s
+        if longest_session is None or msgs > int(longest_session.get("message_count") or 0):
+            longest_session = s
+    top_day = max(best_day.items(), key=lambda kv: kv[1]["tools"]) if best_day else None
+    top_sessions_day = max(sessions_per_day.items(), key=lambda kv: kv[1]) if sessions_per_day else None
+    return {
+        "best_day": {"date": top_day[0], "tool_calls": top_day[1]["tools"]} if top_day else None,
+        "busiest_day": {"date": top_sessions_day[0], "sessions": top_sessions_day[1]} if top_sessions_day else None,
+        "biggest_session": {
+            "title": best_session.get("title") or "Untitled session",
+            "tool_calls": int(best_session.get("tool_call_count") or 0),
+            "date": time.strftime("%Y-%m-%d", time.localtime(float(best_session["started_at"]))) if best_session and best_session.get("started_at") else None,
+        } if best_session else None,
+        "longest_session": {
+            "title": longest_session.get("title") or "Untitled session",
+            "messages": int(longest_session.get("message_count") or 0),
+            "date": time.strftime("%Y-%m-%d", time.localtime(float(longest_session["started_at"]))) if longest_session and longest_session.get("started_at") else None,
+        } if longest_session else None,
+    }
+
+
+def _weekly_challenges(sessions: List[Dict[str, Any]], achievements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Weekly time-boxed goals (Monday-start week) for a faster win cycle."""
+    now = time.time()
+    lt = time.localtime(now)
+    # Monday-start: tm_wday Mon=0.
+    week_start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)) - lt.tm_wday * 86400
+    week_sessions = [s for s in sessions if float(s.get("started_at") or 0) >= week_start]
+    active_days = {time.strftime("%Y-%m-%d", time.localtime(float(s["started_at"]))) for s in week_sessions if s.get("started_at")}
+    week_unlocks = [a for a in achievements if a.get("unlocked") and a.get("unlocked_at") and float(a["unlocked_at"]) >= week_start]
+
+    def base(id_, name, value, target):
+        return {
+            "id": id_,
+            "name": name,
+            "value": value,
+            "target": target,
+            "done": value >= target,
+            "pct": min(100, round((value / target) * 100)) if target else 0,
+        }
+
+    return [
+        base("w_sessions", "Sessions This Week", len(week_sessions), 7),
+        base("w_active_days", "Active Days This Week", len(active_days), 4),
+        base("w_unlocks", "Unlocks This Week", len(week_unlocks), 1),
+        base("w_tool_calls", "Tool Calls This Week", sum(int(s.get("tool_call_count") or 0) for s in week_sessions), 250),
+    ]
+
+
+# ── Quests — combo requirements with bonus XP ────────────────────────────────
+
+QUESTS: List[Dict[str, Any]] = [
+    {
+        "id": "q_power_user",
+        "name": "Power User",
+        "description": "Unlock 3 Tool Mastery badges and complete the Tools set.",
+        "xp": 100,
+        "requirements": {"category_counts": {"Tool Mastery": 3}, "sets": ["Tool Mastery"]},
+    },
+    {
+        "id": "q_full_stack",
+        "name": "Full Stack",
+        "description": "Unlock 2 Vibe Coding and 2 Agent Autonomy badges.",
+        "xp": 100,
+        "requirements": {"category_counts": {"Vibe Coding": 2, "Agent Autonomy": 2}},
+    },
+    {
+        "id": "q_debug_king",
+        "name": "Debug King",
+        "description": "Unlock 4 Debugging Chaos badges and hit a 7-day streak.",
+        "xp": 150,
+        "requirements": {"category_counts": {"Debugging Chaos": 4}, "streak_days": 7},
+    },
+    {
+        "id": "q_model_gourmet",
+        "name": "Model Gourmet",
+        "description": "Unlock 3 Model Lore badges and use 3 distinct models.",
+        "xp": 100,
+        "requirements": {"category_counts": {"Model Lore": 3}, "distinct_models": 3},
+    },
+    {
+        "id": "q_hermes_phd",
+        "name": "Hermes PhD",
+        "description": "Unlock 4 Hermes Native badges and 4 Model Lore badges.",
+        "xp": 150,
+        "requirements": {"category_counts": {"Hermes Native": 4, "Model Lore": 4}},
+    },
+]
+
+
+def evaluate_quests(achievements: List[Dict[str, Any]], aggregate: Dict[str, Any], completions: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    unlocked_ids = {a["id"] for a in achievements if a.get("unlocked")}
+    cat_counts: Dict[str, int] = {}
+    for a in achievements:
+        if a.get("unlocked") and a.get("kind") != "collection":
+            cat = a.get("category") or ""
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    sets_done = {a.get("collection") for a in achievements if a.get("kind") == "collection" and a.get("unlocked")}
+    streak = int(aggregate.get("max_streak_days") or 0)
+    models = int(aggregate.get("distinct_model_count") or 0)
+    completions = completions or {}
+
+    out = []
+    for q in QUESTS:
+        req = q.get("requirements", {})
+        ok = True
+        for cat, need in req.get("category_counts", {}).items():
+            if cat_counts.get(cat, 0) < need:
+                ok = False
+        for set_name in req.get("sets", []):
+            if set_name not in sets_done:
+                ok = False
+        if req.get("streak_days") and streak < req["streak_days"]:
+            ok = False
+        if req.get("distinct_models") and models < req["distinct_models"]:
+            ok = False
+        entry = {**q, "done": ok, "unlocked_ids": len(unlocked_ids)}
+        # Monotonic completion: once a quest is recorded in the ledger it
+        # stays done, even if a later scan no longer meets the requirements
+        # (same contract as the unlock ledger). completed_at comes from the
+        # ledger when present.
+        if q["id"] in completions:
+            entry["done"] = True
+            entry["completed_at"] = completions[q["id"]].get("completed_at")
+        out.append(entry)
+    return out
+
+
+def load_quest_completions() -> Dict[str, Any]:
+    """Quest completion ledger: quest id → {completed_at}. Monotonic — a
+    quest is completed once; later scans never un-complete it."""
+    state = load_state()
+    completions = state.get("quest_completions")
+    if isinstance(completions, dict):
+        return completions
+    return {}
+
+
+def record_quest_completions(quests: List[Dict[str, Any]]) -> None:
+    """Persist newly-done quests to the ledger. Only called on finished
+    scans (never partial snapshots) so a half-scanned session can't stamp a
+    completion time that a later session would shift."""
+    state = load_state()
+    completions = state.setdefault("quest_completions", {})
+    now = int(time.time())
+    changed = False
+    for q in quests:
+        if q.get("done") and q.get("id") not in completions:
+            completions[q["id"]] = {"completed_at": now}
+            changed = True
+    if changed:
+        save_state(state)
+
+
+def quest_xp(quests: List[Dict[str, Any]]) -> int:
+    return sum(int(q.get("xp") or 0) for q in quests if q.get("done"))
+
+
+def _recent_daily_rates(sessions: List[Dict[str, Any]], window_days: int = 14) -> Dict[str, float]:
+    """Per-metric daily accumulation rate over the last ``window_days`` days.
+
+    Aggregates only sessions started within the window, then divides each
+    cumulative metric by the window length. Used for "days until next tier
+    at your current pace" estimates on lifetime achievements.
+    """
+    if not sessions:
+        return {}
+    cutoff = time.time() - window_days * 86400
+    recent = []
+    for s in sessions:
+        started = s.get("started_at")
+        if not started:
+            continue
+        try:
+            if float(started) >= cutoff:
+                recent.append(s)
+        except Exception:
+            continue
+    if not recent:
+        return {}
+    recent_agg = aggregate_stats(recent)
+    rates: Dict[str, float] = {}
+    for key, value in recent_agg.items():
+        if isinstance(value, (int, float)) and value > 0:
+            rates[key] = float(value) / window_days
+    return rates
+
+
 def _compute_from_scan(scan: Dict[str, Any], *, is_partial: bool = False) -> Dict[str, Any]:
     """Evaluate every achievement definition against a scan result.
 
@@ -793,19 +1715,69 @@ def _compute_from_scan(scan: Dict[str, Any], *, is_partial: bool = False) -> Dic
     "unlock time" based on half a scan that a later session might shift.
     """
     aggregate = scan.get("aggregate", {})
-    state = load_state() if not is_partial else {"unlocks": {}}
+    state = load_state()
+    if is_partial:
+        # Partial scans MUST still see the ledger for monotonic forcing.
+        # A background scan streams sessions in gradually; if a partial
+        # snapshot were computed with an empty ledger, already-earned
+        # unlocks would drop out of the served numbers mid-scan (e.g.
+        # 18/69 → 15, Lv6 → Lv5) until the final scan landed. Read the
+        # ledger for forcing, but never write new unlocks from a partial.
+        state = {**state, "unlocks": dict(state.get("unlocks", {}))}
     unlocks = state.setdefault("unlocks", {})
     now = int(time.time())
+    rates = _recent_daily_rates(scan.get("sessions", []))
     evaluated = []
+    # First pass: regular achievements (populates the ledger for collections).
     for definition in ACHIEVEMENTS:
+        if definition.get("kind") == "collection":
+            continue
         result = evaluate_definition(definition, aggregate)
         unlock_id = definition["id"]
         if not is_partial and result["unlocked"] and unlock_id not in unlocks:
-            unlocks[unlock_id] = {"unlocked_at": now, "first_tier": result.get("tier"), "evidence": evidence_for(definition, scan.get("sessions", []))}
+            unlocks[unlock_id] = {"unlocked_at": now, "first_tier": result.get("tier"), "highest_tier": result.get("tier"), "evidence": evidence_for(definition, scan.get("sessions", []))}
         item = {**definition, **result}
+        # Monotonicity: an unlock recorded in the ledger is permanent. A scan
+        # that temporarily misses the session (e.g. partial window, archive
+        # flag flip, DB hiccup) must never re-lock a badge the user already
+        # earned. The ledger is the source of truth for "has been earned".
+        # The TIER is monotonic too: XP comes from the tier, so a transient
+        # scan downgrade (Gold → Silver) would shrink XP and drop the level.
+        # Track the highest tier ever reached and clamp display to it.
+        if unlock_id in unlocks:
+            item["unlocked"] = True
+            item["state"] = "unlocked"
+            rec = unlocks[unlock_id]
+            cur_rank = tier_rank_of(item.get("tier"))
+            rec_rank = tier_rank_of(rec.get("highest_tier"))
+            if cur_rank > rec_rank:
+                rec["highest_tier"] = item.get("tier")
+            item["tier"] = rec.get("highest_tier") or rec.get("first_tier") or item.get("tier")
         if result["unlocked"]:
             item["unlocked_at"] = unlocks.get(unlock_id, {}).get("unlocked_at")
             item["evidence"] = unlocks.get(unlock_id, {}).get("evidence") or evidence_for(definition, scan.get("sessions", []))
+        # ETA: days until the next tier at the recent daily rate, for
+        # lifetime accumulation metrics only (a best-session feat can jump
+        # in one run, so a rate-based estimate would mislead).
+        eta = _eta_days_for(item, rates)
+        if eta is not None:
+            item["eta_days"] = eta
+        evaluated.append(display_achievement(item))
+    # Second pass: set collections, evaluated against the now-current ledger.
+    for definition in ACHIEVEMENTS:
+        if definition.get("kind") != "collection":
+            continue
+        result = evaluate_collection(definition, set(unlocks.keys()))
+        unlock_id = definition["id"]
+        if not is_partial and result["unlocked"] and unlock_id not in unlocks:
+            unlocks[unlock_id] = {"unlocked_at": now, "first_tier": result.get("tier"), "evidence": None}
+        item = {**definition, **result}
+        if unlock_id in unlocks:
+            item["unlocked"] = True
+            item["state"] = "unlocked"
+            item["tier"] = "Olympian"
+        if result["unlocked"]:
+            item["unlocked_at"] = unlocks.get(unlock_id, {}).get("unlocked_at")
         evaluated.append(display_achievement(item))
     if not is_partial:
         save_state(state)
@@ -1005,7 +1977,217 @@ async def achievements():
         **(data.get("scan_meta") or {}),
         "status": _scan_status_payload(),
     }
+    aggregate = data.get("aggregate") or {}
+    payload["streak"] = {
+        "max_streak_days": int(aggregate.get("max_streak_days") or 0),
+        "current_streak_days": int(aggregate.get("current_streak_days") or 0),
+    }
+    payload["activity"] = _activity_calendar(data.get("sessions", []))
+    unlocked_ids = {a["id"] for a in data.get("achievements", []) if a.get("unlocked")}
+    payload["rewards"] = evaluate_rewards(data.get("achievements", []), aggregate, unlocked_ids)
+    payload["level"] = compute_xp(data.get("achievements", []), aggregate)
+    payload["categories"] = _category_summary(data.get("achievements", []))
+    payload["challenges"] = _monthly_challenges(data.get("sessions", []), data.get("achievements", []))
+    payload["weekly"] = _weekly_challenges(data.get("sessions", []), data.get("achievements", []))
+    payload["records"] = _records(data.get("sessions", []))
+    payload["quests"] = evaluate_quests(data.get("achievements", []), aggregate, load_quest_completions())
+    # Persist newly-completed quests (finished scans only — /achievements
+    # serves the final snapshot cache, never a partial).
+    record_quest_completions(payload["quests"])
+    completed = [
+        {**q, "completed_at": q.get("completed_at")}
+        for q in payload["quests"]
+        if q.get("done") and q.get("completed_at")
+    ]
+    completed.sort(key=lambda q: q.get("completed_at") or 0, reverse=True)
+    payload["recently_completed_quests"] = completed[:5]
+    payload["custom_goals"] = evaluate_custom_goals(load_custom_goals(), aggregate, data.get("sessions", []))
+    payload["custom_metric_options"] = CUSTOM_METRIC_METRICS
     return payload
+
+
+@router.get("/rewards")
+async def rewards():
+    data = evaluate_all()
+    aggregate = data.get("aggregate") or {}
+    unlocked_ids = {a["id"] for a in data.get("achievements", []) if a.get("unlocked")}
+    return {"ok": True, "rewards": evaluate_rewards(data.get("achievements", []), aggregate, unlocked_ids)}
+
+
+@router.post("/rewards/{reward_id}/install")
+async def install_reward(reward_id: str):
+    """Install an unlocked reward theme into the skins directory.
+
+    The reward YAML lives in this plugin; installing copies it to
+    ``<hermes_home>/skins/<theme>.yaml`` so the desktop Appearance list
+    (and the Theme Switcher plugin, if installed) picks it up like any
+    other skin. Refuses locked rewards.
+    """
+    data = evaluate_all()
+    aggregate = data.get("aggregate") or {}
+    unlocked_ids = {a["id"] for a in data.get("achievements", []) if a.get("unlocked")}
+    evaluated = evaluate_rewards(data.get("achievements", []), aggregate, unlocked_ids)
+    reward = next((r for r in evaluated if r["id"] == reward_id), None)
+    if not reward:
+        return {"ok": False, "error": f"unknown reward '{reward_id}'"}
+    if not reward["unlocked"]:
+        return {"ok": False, "error": f"reward '{reward_id}' is not unlocked yet"}
+    theme = reward.get("theme", "")
+    yaml_text = REWARD_THEMES.get(theme)
+    if not yaml_text:
+        return {"ok": False, "error": f"no theme payload for '{theme}'"}
+    try:
+        skins_dir = get_hermes_home() / "skins"
+        skins_dir.mkdir(parents=True, exist_ok=True)
+        dest = skins_dir / f"{theme}.yaml"
+        dest.write_text(yaml_text, encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": f"failed to install reward theme: {exc}"}
+    return {"ok": True, "installed": theme}
+
+
+@router.get("/custom-goals")
+async def custom_goals():
+    data = evaluate_all()
+    aggregate = data.get("aggregate") or {}
+    return {"ok": True, "goals": evaluate_custom_goals(load_custom_goals(), aggregate, data.get("sessions", [])), "options": CUSTOM_METRIC_METRICS}
+
+
+@router.post("/custom-goals")
+async def create_custom_goal(body: Dict[str, Any]):
+    name = str(body.get("name") or "").strip()
+    metric = str(body.get("metric") or "").strip()
+    target = int(body.get("target") or 0)
+    if not name or metric not in CUSTOM_METRIC_METRICS or target <= 0:
+        return {"ok": False, "error": "name, a valid metric, and a positive target are required"}
+    goals = load_custom_goals()
+    goal = {
+        "id": f"cg_{int(time.time())}_{len(goals)}",
+        "name": name[:80],
+        "metric": metric,
+        "target": target,
+        "created_at": int(time.time()),
+    }
+    goals.append(goal)
+    save_custom_goals(goals)
+    return {"ok": True, "goal": goal}
+
+
+@router.delete("/custom-goals/{goal_id}")
+async def delete_custom_goal(goal_id: str):
+    goals = load_custom_goals()
+    remaining = [g for g in goals if g.get("id") != goal_id]
+    if len(remaining) == len(goals):
+        return {"ok": False, "error": f"unknown goal '{goal_id}'"}
+    save_custom_goals(remaining)
+    return {"ok": True}
+
+
+@router.get("/badge.svg")
+async def badge_svg():
+    """Flat README badge: level + tier + streak as an SVG shield.
+
+    Usable in any README: ![](https://host/api/plugins/hermes-achievements/badge.svg)
+    Uses only system fonts and plain shapes, no external assets.
+    """
+    data = evaluate_all()
+    achievements = data.get("achievements", [])
+    agg = data.get("aggregate") or {}
+    level = compute_xp(achievements)
+    unlocked = sum(1 for a in achievements if a.get("unlocked"))
+    streak = int(agg.get("current_streak_days") or 0)
+    total = len(achievements)
+
+    left = "Hermes"
+    right = f"Lv{level['level']} · {unlocked}/{total}"
+    if streak >= 2:
+        right = f"Lv{level['level']} · {unlocked}/{total} · 🔥{streak}"
+
+    left_w = 8 + len(left) * 6.2
+    right_w = 8 + len(right) * 6.2
+    total_w = left_w + right_w
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{int(total_w)}" height="20" role="img" aria-label="Hermes achievements: {right}">
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <clipPath id="r"><rect width="{int(total_w)}" height="20" rx="3" fill="#fff"/></clipPath>
+  <g clip-path="url(#r)">
+    <rect width="{int(left_w)}" height="20" fill="#555"/>
+    <rect x="{int(left_w)}" width="{int(right_w)}" height="20" fill="#7B2D8E"/>
+    <rect width="{int(total_w)}" height="20" fill="url(#s)"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">
+    <text x="{int(left_w / 2)}" y="14">{left}</text>
+    <text x="{int(left_w + right_w / 2)}" y="14">{right}</text>
+  </g>
+</svg>'''
+    return Response(content=svg, media_type="image/svg+xml")
+
+
+@router.get("/badge-wall.svg")
+async def badge_wall_svg():
+    """Full badge collection as an SVG poster.
+
+    Renders every achievement in a uniform grid, colored by category, with
+    tier chips and progress bars. Ready to screenshot for social posts or
+    embed anywhere an SVG is accepted. No external assets.
+    """
+    data = evaluate_all()
+    achievements = data.get("achievements", [])
+    level = compute_xp(achievements, data.get("aggregate") or {})
+    unlocked = sum(1 for a in achievements if a.get("unlocked"))
+
+    cols = 8
+    card_w = 150
+    card_h = 92
+    gap = 12
+    pad = 28
+    rows = (len(achievements) + cols - 1) // cols
+    width = pad * 2 + cols * card_w + (cols - 1) * gap
+    height = pad * 2 + rows * card_h + (rows - 1) * gap
+
+    def esc(s):
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Category hue map (matches the desktop plugin).
+    cat_hue = {
+        "Agent Autonomy": 250, "Debugging Chaos": 15, "Hermes Native": 205,
+        "Lifestyle": 150, "Model Lore": 330, "Research/Web": 275,
+        "Sets": 45, "Tool Mastery": 190, "Vibe Coding": 0,
+    }
+    def cat_color(cat):
+        return f"hsl({cat_hue.get(cat, 220)} 55% 45%)"
+
+    cards = []
+    for idx, a in enumerate(achievements):
+        r, c = divmod(idx, cols)
+        x = pad + c * (card_w + gap)
+        y = pad + r * (card_h + gap)
+        color = cat_color(a.get("category", ""))
+        name = "???" if a.get("state") == "secret" else (a.get("name") or "")
+        tier = a.get("tier") or ""
+        pct = min(100, int(a.get("progress_pct") or 0)) if not a.get("unlocked") else 100
+        fill = "hsl(45 90% 92%)" if a.get("kind") == "collection" else ("hsl(220 15% 96%)" if not a.get("unlocked") else "hsl(0 0% 94%)")
+        cards.append(f'''
+    <g transform="translate({x},{y})">
+      <rect width="{card_w}" height="{card_h}" rx="8" fill="{fill}" stroke="{color}" stroke-opacity="0.5" stroke-width="1.5"/>
+      <rect width="4" height="{card_h}" rx="2" fill="{color}"/>
+      <text x="12" y="22" font-size="10.5" font-weight="600" fill="#333" font-family="Verdana,DejaVu Sans,sans-serif">{esc(name)}</text>
+      <text x="12" y="38" font-size="7.5" fill="#888" font-family="Verdana,DejaVu Sans,sans-serif">{esc(a.get("category", ""))}</text>
+      <rect x="12" y="46" width="{card_w - 24}" height="5" rx="2.5" fill="#e5e5e5"/>
+      <rect x="12" y="46" width="{(card_w - 24) * pct // 100}" height="5" rx="2.5" fill="{color}"/>
+      <text x="12" y="70" font-size="8" font-weight="600" fill="{color}" font-family="Verdana,DejaVu Sans,sans-serif">{esc(tier) if tier else ("EARNED" if a.get("unlocked") else "locked")}</text>
+      <text x="{card_w - 12}" y="70" text-anchor="end" font-size="8" fill="#999" font-family="Verdana,DejaVu Sans,sans-serif">{pct}%</text>
+    </g>''')
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <rect width="{width}" height="{height}" fill="#fafafa"/>
+  <text x="{pad}" y="18" font-size="14" font-weight="700" fill="#333" font-family="Verdana,DejaVu Sans,sans-serif">Hermes Achievements — {unlocked}/{len(achievements)} unlocked · Level {level['level']} {level['name']}</text>
+  {''.join(cards)}
+</svg>'''
+    return Response(content=svg, media_type="image/svg+xml")
 
 
 @router.get("/scan-status")
@@ -1028,8 +2210,17 @@ async def session_badges(session_id: str):
     aggregate = aggregate_stats([session])
     badges = []
     for definition in ACHIEVEMENTS:
-        result = evaluate_definition(definition, aggregate)
-        if result["unlocked"]:
+        try:
+            result = evaluate_definition(definition, aggregate)
+        except Exception:
+            # Some definitions cannot be evaluated against a single session
+            # (secret achievements with hidden criteria, collection badges,
+            # anything without a metric/threshold key). Skipping them is
+            # correct for the per-session view; crashing on one definition
+            # used to 500 the whole endpoint, so "Badges this session"
+            # never populated for any session.
+            continue
+        if result.get("unlocked"):
             badges.append(display_achievement({**definition, **result}))
     return {"session_id": session_id, "badges": badges}
 
