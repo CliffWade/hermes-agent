@@ -2217,10 +2217,55 @@ async def recent_unlocks():
     return sorted([a for a in data["achievements"] if a["unlocked"]], key=lambda a: a.get("unlocked_at") or 0, reverse=True)[:20]
 
 
+def _resolve_stored_session_id(session_id: str) -> str:
+    """Resolve a runtime session id to its stored session id.
+
+    The desktop plugin host exposes ``host.state.activeSessionId`` as the
+    gateway's RUNTIME session id (the in-memory key in ``tui_gateway``'s
+    ``_sessions`` map), which is different from the STORED session id
+    (e.g. ``20260807_170436_b7b698``) that the scan snapshot is keyed by.
+    Without translation, the per-session badges endpoint can never find the
+    live session and "This session" renders empty even when badges exist.
+
+    Resolution strategy (cheapest first):
+      1. If the id already matches a stored session, return it unchanged.
+      2. If the gateway is running in this process (it is: the plugin API is
+         mounted inside the same web server that serves /api/ws), translate
+         the runtime id via tui_gateway's live ``_sessions`` registry.
+      3. Fall back to the id as-is when the gateway isn't reachable so the
+         endpoint never 500s.
+    """
+    if not session_id:
+        return session_id
+
+    # Fast path: already a stored session id.
+    try:
+        data = evaluate_all()
+        if any(s["session_id"] == session_id for s in data["sessions"]):
+            return session_id
+    except Exception:
+        pass
+
+    # Runtime -> stored translation via the live gateway session registry.
+    try:
+        from tui_gateway.server import _sessions, _sessions_lock
+        with _sessions_lock:
+            session = _sessions.get(session_id)
+            if session:
+                key = session.get("session_key") or ""
+                if key:
+                    return key
+    except Exception:
+        pass
+
+    return session_id
+
+
 @router.get("/sessions/{session_id}/badges")
 async def session_badges(session_id: str):
     data = evaluate_all()
-    session = next((s for s in data["sessions"] if s["session_id"] == session_id), None)
+    resolved_id = _resolve_stored_session_id(session_id)
+    session = next((s for s in data["sessions"] if s["session_id"] == resolved_id), None)
     if not session:
         return {"session_id": session_id, "badges": []}
     aggregate = aggregate_stats([session])
